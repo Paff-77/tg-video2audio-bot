@@ -23,21 +23,3 @@
    docker compose up -d
    docker compose logs -f
    ```
-3) bot-api 将缓存文件到 `/var/lib/telegram-bot-api/...`；bot 容器挂载同一路径（读写）。
-
-## 本地运行（非容器）
-```bash
-pip install -r requirements.txt
-export BOT_TOKEN=你的TelegramBotToken
-# 指向自建 API（可选）
-export TG_BASE_URL=http://localhost:8081
-export TG_FILE_BASE_URL=http://localhost:8081
-# 授权白名单（可选）
-export ALLOWED_USER_IDS="12345678 987654321"
-python app.py
-```
-
-## 故障排查
-- 未授权用户无响应：属正常行为。若想提示“私有 Bot”，可自行在代码中添加未授权提示逻辑。
-- Timed out/404：已内置直链回退与本地直读；检查网络与卷挂载。
-- 删除失败：确保 bot 服务挂载卷为读写（不要加 `:ro`）。
