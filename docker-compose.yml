@@ -1,0 +1,43 @@
+version: "3.8"
+services:
+  bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: tg-bot-api
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      TELEGRAM_API_ID: "${TELEGRAM_API_ID}"
+      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH}"
+      TELEGRAM_LOCAL: "1"
+      TELEGRAM_VERBOSITY: "1"
+    volumes:
+      - bot_api_data:/var/lib/telegram-bot-api
+
+  bot:
+    build: .
+    container_name: tg-video2audio-bot
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: "${BOT_TOKEN}"
+      AUDIO_EXT: "${AUDIO_EXT:-mp3}"
+      AUDIO_BITRATE: "${AUDIO_BITRATE:-192k}"
+      TG_BASE_URL: "http://bot-api:8081"
+      TG_FILE_BASE_URL: "http://bot-api:8081"
+      TG_CONNECT_TIMEOUT: "${TG_CONNECT_TIMEOUT:-30}"
+      TG_READ_TIMEOUT: "${TG_READ_TIMEOUT:-600}"
+      TG_WRITE_TIMEOUT: "${TG_WRITE_TIMEOUT:-600}"
+      TG_POOL_TIMEOUT: "${TG_POOL_TIMEOUT:-60}"
+      TG_MAX_CONNECTIONS: "${TG_MAX_CONNECTIONS:-100}"
+      TG_MAX_KEEPALIVE: "${TG_MAX_KEEPALIVE:-20}"
+      # 清理策略
+      CLEANUP_OUTPUT: "${CLEANUP_OUTPUT:-1}"
+      CLEANUP_LOCAL_SOURCE: "${CLEANUP_LOCAL_SOURCE:-1}"
+    depends_on:
+      - bot-api
+    # 关键：共享 bot-api 的本地缓存目录（读写，便于删除缓存视频）
+    volumes:
+      - bot_api_data:/var/lib/telegram-bot-api
+
+volumes:
+  bot_api_data:
