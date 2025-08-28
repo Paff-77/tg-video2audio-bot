@@ -33,6 +33,8 @@ services:
       # 清理策略
       CLEANUP_OUTPUT: "${CLEANUP_OUTPUT:-1}"
       CLEANUP_LOCAL_SOURCE: "${CLEANUP_LOCAL_SOURCE:-1}"
+      # 授权白名单（逗号或空格分隔的 Telegram 用户ID；留空=不限制）
+      ALLOWED_USER_IDS: "${ALLOWED_USER_IDS:-}"
     depends_on:
       - bot-api
     # 关键：共享 bot-api 的本地缓存目录（读写，便于删除缓存视频）

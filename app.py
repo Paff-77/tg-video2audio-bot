@@ -47,6 +47,20 @@ def _env_bool(name: str, default: bool) -> bool:
         return default
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
+def _env_id_set(name: str) -> set[int]:
+    """
+    从环境变量解析 ID 白名单，支持逗号/空白分隔。
+    为空表示不限制（允许所有）。
+    """
+    raw = os.getenv(name, "")
+    ids: set[int] = set()
+    for part in raw.replace(",", " ").split():
+        try:
+            ids.add(int(part))
+        except Exception:
+            pass
+    return ids
+
 # HTTP 超时/连接池（大文件友好）
 CONNECT_TIMEOUT = _env_float("TG_CONNECT_TIMEOUT", 30.0)
 READ_TIMEOUT = _env_float("TG_READ_TIMEOUT", 600.0)
@@ -56,11 +70,11 @@ MAX_CONNECTIONS = _env_int("TG_MAX_CONNECTIONS", 100)
 MAX_KEEPALIVE = _env_int("TG_MAX_KEEPALIVE", 20)
 
 # 清理策略
-# - 发送完毕后删除输出音频文件（默认开启，尽快释放空间；即便不开也会随临时目录清理）
 CLEANUP_OUTPUT = _env_bool("CLEANUP_OUTPUT", True)
-# - 若使用 bot-api 本地缓存作为输入，发送完毕后删除该源视频（默认开启）
-#   仅当路径明确位于该 bot 的缓存目录下才会删除，避免误删。
 CLEANUP_LOCAL_SOURCE = _env_bool("CLEANUP_LOCAL_SOURCE", True)
+
+# 授权白名单：允许使用的 Telegram user id 集合（为空则不限制）
+ALLOWED_USER_IDS: set[int] = _env_id_set("ALLOWED_USER_IDS")
 
 # 手动直链下载前缀（初始化于 _build_application）
 FILE_URL_PREFIX = ""  # http://host:port/file/bot<token>
@@ -427,26 +441,38 @@ def _build_application() -> Application:
         logger.info("Using self-hosted Bot API server: base_url=%s | base_file_url=%s", base_url, file_base)
         if request is not None:
             bot = Bot(token=BOT_TOKEN, base_url=base_url, base_file_url=file_base, request=request)
-            return Application.builder().bot(bot).build()
+            app_builder = Application.builder().bot(bot)
         else:
             bot = Bot(token=BOT_TOKEN, base_url=base_url, base_file_url=file_base)
-            return Application.builder().bot(bot).build()
+            app_builder = Application.builder().bot(bot)
     else:
         if request is not None:
-            return Application.builder().token(BOT_TOKEN).request(request).build()
+            app_builder = Application.builder().token(BOT_TOKEN).request(request)
         else:
-            return Application.builder().token(BOT_TOKEN).build()
+            app_builder = Application.builder().token(BOT_TOKEN)
+
+    app = app_builder.build()
+
+    # 授权过滤器：若 ALLOWED_USER_IDS 非空，则仅放行这些用户
+    if ALLOWED_USER_IDS:
+        allowed_filter = filters.User(user_id=list(ALLOWED_USER_IDS))
+        logger.info("Authorization enabled. Allowed user IDs: %s", sorted(ALLOWED_USER_IDS))
+    else:
+        allowed_filter = filters.ALL
+        logger.info("Authorization disabled (ALLOWED_USER_IDS empty). Bot is open to all users.")
+
+    # Handlers（均附带授权过滤器）
+    app.add_handler(CommandHandler("start", start, filters=allowed_filter))
+    app.add_handler(CommandHandler("help", help_cmd, filters=allowed_filter))
+    app.add_handler(MessageHandler((filters.VIDEO | filters.VIDEO_NOTE) & allowed_filter, handle_video_like))
+    app.add_handler(MessageHandler(filters.Document.MimeType("video/") & allowed_filter, handle_video_like))
+    app.add_error_handler(error_handler)
+
+    return app
 
 
 def main():
     app = _build_application()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video_like))
-    app.add_handler(MessageHandler(filters.Document.MimeType("video/"), handle_video_like))
-    app.add_error_handler(error_handler)
-
     logger.info("Bot started. Waiting for messages...")
     app.run_polling(close_loop=False)
 
