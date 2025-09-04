@@ -23,7 +23,7 @@ FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "192k")
 AUDIO_EXT = os.getenv("AUDIO_EXT", "mp3")
 
-# 自建 Bot API Server（例如 http://localhost:8081 或 http://bot-api:8081）
+# 自建 Bot API Server（例如 http://localhost:8081 或 http://tg-bot-api:8081）
 TG_BASE_URL = os.getenv("TG_BASE_URL", "").strip().rstrip("/")
 TG_FILE_BASE_URL = os.getenv("TG_FILE_BASE_URL", "").strip().rstrip("/")
 
@@ -49,7 +49,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _env_id_set(name: str) -> set[int]:
     """
-    从环境变量解析 ID 白名单，支持逗号/空白分隔。
+    解析环境变量为 ID 白名单集合，支持逗号或空白分隔。
     为空表示不限制（允许所有）。
     """
     raw = os.getenv(name, "")
@@ -73,8 +73,9 @@ MAX_KEEPALIVE = _env_int("TG_MAX_KEEPALIVE", 20)
 CLEANUP_OUTPUT = _env_bool("CLEANUP_OUTPUT", True)
 CLEANUP_LOCAL_SOURCE = _env_bool("CLEANUP_LOCAL_SOURCE", True)
 
-# 授权白名单：允许使用的 Telegram user id 集合（为空则不限制）
-ALLOWED_USER_IDS: set[int] = _env_id_set("ALLOWED_USER_IDS")
+# 鉴权白名单
+ALLOWED_USER_IDS: set[int] = _env_id_set("ALLOWED_USER_IDS")   # 用户白名单
+ALLOWED_CHAT_IDS: set[int] = _env_id_set("ALLOWED_CHAT_IDS")   # 聊天白名单（群/超群/频道）
 
 # 手动直链下载前缀（初始化于 _build_application）
 FILE_URL_PREFIX = ""  # http://host:port/file/bot<token>
@@ -193,12 +194,10 @@ def _safe_remove_local_source(local_src: Optional[str]):
     if not local_src or not CLEANUP_LOCAL_SOURCE:
         return
 
-    # 必须是绝对路径且处于 BOT_API_LOCAL_ROOT 下
     if not local_src.startswith(BOT_API_LOCAL_ROOT):
         logger.warning("Skip deleting local source outside BOT_API_LOCAL_ROOT: %s", local_src)
         return
 
-    # 仅删除属于当前 bot token 的目录里的文件，避免误删其他 bot 的缓存
     token_prefix = os.path.join(BOT_API_LOCAL_ROOT, BOT_TOKEN)
     if not local_src.startswith(token_prefix):
         logger.warning("Skip deleting local source not under this bot token dir: %s", local_src)
@@ -249,16 +248,14 @@ async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         with tempfile.TemporaryDirectory(prefix="tg_v2a_") as td:
             td_path = Path(td)
-            temp_dl = td_path / "input_video"  # 若需要下载，则下载到此处
+            temp_dl = td_path / "input_video"
             out_name = _suggest_filename(filename, "audio", AUDIO_EXT)
             out_path = td_path / out_name
 
-            # 选择输入源
             if local_source:
                 input_path = Path(local_source)
                 logger.info("Using local source: %s", input_path)
             else:
-                # 先尝试 PTB 下载；失败再直链下载
                 try:
                     logger.info("Downloading via PTB to %s", temp_dl)
                     await file.download_to_drive(custom_path=str(temp_dl))
@@ -274,7 +271,6 @@ async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     input_path = temp_dl
                     logger.info("Direct download completed: %s bytes", temp_dl.stat().st_size if temp_dl.exists() else "unknown")
 
-            # ffmpeg 转码
             codec_map = {
                 "mp3": "libmp3lame",
                 "m4a": "aac",
@@ -287,13 +283,10 @@ async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             acodec = codec_map.get(AUDIO_EXT.lower(), "libmp3lame")
             cmd = [
-                FFMPEG_BIN,
-                "-y",
-                "-i",
-                str(input_path),
+                FFMPEG_BIN, "-y",
+                "-i", str(input_path),
                 "-vn",
-                "-acodec",
-                acodec,
+                "-acodec", acodec,
             ]
             if AUDIO_EXT.lower() in {"mp3", "m4a", "aac", "opus", "ogg"} and AUDIO_BITRATE:
                 cmd += ["-b:a", AUDIO_BITRATE]
@@ -307,14 +300,12 @@ async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tail = (proc.stderr or "")[-2000:]
                 logger.error("ffmpeg failed: %s", tail)
                 await status.edit_text("转换失败：ffmpeg 处理出错。请确认视频编码有效或稍后重试。")
-                # 即使失败，也尝试根据策略清理源视频（本地直读时）
                 _safe_remove_local_source(local_source)
                 return
 
             await status.edit_text("转换完成，正在发送音频…")
             await _send_chat_action(update, ChatAction.UPLOAD_DOCUMENT, context)
 
-            # 发送音频（优先 send_audio，失败回退 send_document）
             send_ok = False
             try:
                 with open(out_path, "rb") as f:
@@ -338,7 +329,6 @@ async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error("send_document also failed: %s", send_err2)
                     send_ok = False
 
-            # 发送后清理：输出音频 +（可选）本地源视频
             if CLEANUP_OUTPUT:
                 _safe_unlink(out_path)
             _safe_remove_local_source(local_source)
@@ -371,7 +361,6 @@ def _build_request_safe():
         logger.warning("HTTPXRequest not available; using default PTB request.")
         return None
 
-    # 分级降级，适配不同 ptb 版本
     try:
         limits = httpx.Limits(max_keepalive_connections=MAX_KEEPALIVE, max_connections=MAX_CONNECTIONS)
         req = HTTPXRequest(
@@ -431,7 +420,6 @@ def _build_application() -> Application:
 
     base_url, file_base = _normalize_urls()
 
-    # 设置直链前缀
     global FILE_URL_PREFIX
     if file_base:
         FILE_URL_PREFIX = f"{file_base}{BOT_TOKEN}"
@@ -453,13 +441,25 @@ def _build_application() -> Application:
 
     app = app_builder.build()
 
-    # 授权过滤器：若 ALLOWED_USER_IDS 非空，则仅放行这些用户
-    if ALLOWED_USER_IDS:
-        allowed_filter = filters.User(user_id=list(ALLOWED_USER_IDS))
-        logger.info("Authorization enabled. Allowed user IDs: %s", sorted(ALLOWED_USER_IDS))
+    # 授权过滤器：组合用户与聊天白名单
+    user_filter = filters.User(user_id=list(ALLOWED_USER_IDS)) if ALLOWED_USER_IDS else None
+    chat_filter = filters.Chat(chat_id=list(ALLOWED_CHAT_IDS)) if ALLOWED_CHAT_IDS else None
+
+    if user_filter and chat_filter:
+        allowed_filter = user_filter | chat_filter
+        logger.info(
+            "Authorization enabled. Allowed users: %s | Allowed chats: %s",
+            sorted(ALLOWED_USER_IDS), sorted(ALLOWED_CHAT_IDS)
+        )
+    elif user_filter:
+        allowed_filter = user_filter
+        logger.info("Authorization enabled. Allowed users: %s", sorted(ALLOWED_USER_IDS))
+    elif chat_filter:
+        allowed_filter = chat_filter
+        logger.info("Authorization enabled. Allowed chats: %s", sorted(ALLOWED_CHAT_IDS))
     else:
         allowed_filter = filters.ALL
-        logger.info("Authorization disabled (ALLOWED_USER_IDS empty). Bot is open to all users.")
+        logger.info("Authorization disabled (ALLOWED_USER_IDS & ALLOWED_CHAT_IDS empty). Bot is open to all chats/users.")
 
     # Handlers（均附带授权过滤器）
     app.add_handler(CommandHandler("start", start, filters=allowed_filter))
