@@ -3,11 +3,11 @@ import os
 import shlex
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
 from telegram import Update, Bot
-from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 import httpx
@@ -48,10 +48,6 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 def _env_id_set(name: str) -> set[int]:
-    """
-    解析环境变量为 ID 白名单集合，支持逗号或空白分隔。
-    为空表示不限制（允许所有）。
-    """
     raw = os.getenv(name, "")
     ids: set[int] = set()
     for part in raw.replace(",", " ").split():
@@ -99,13 +95,6 @@ def _has_ffmpeg() -> bool:
         return False
 
 
-async def _send_chat_action(update: Update, action: ChatAction, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=action)
-    except Exception:
-        pass
-
-
 def _suggest_filename(base: Optional[str], default_stem: str, ext: str) -> str:
     try:
         stem = Path(base).stem if base else default_stem
@@ -115,31 +104,94 @@ def _suggest_filename(base: Optional[str], default_stem: str, ext: str) -> str:
         return f"{default_stem}.{ext.lstrip('.')}"
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "发送一个视频给我，我会把它转换成音频并返回。\n"
-        f"- 输出格式: {AUDIO_EXT}\n"
-        f"- 比特率: {AUDIO_BITRATE}\n\n"
-        "服务端可用 AUDIO_EXT / AUDIO_BITRATE 修改。\n"
-        "若配置自建 Bot API Server，可突破官方 50MB 文件限制。"
-    )
-    await update.message.reply_text(text)
+def _human_size(n_bytes: int) -> str:
+    if n_bytes is None:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(n_bytes)
+    for u in units:
+        if size < 1024 or u == units[-1]:
+            if u in ("MB", "GB", "TB"):
+                return f"{size:.1f} {u}"
+            return f"{int(size)} {u}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("直接给我发视频即可，我会抽取音频并返回。也可以用 /start 查看当前配置。")
+def _fmt_speed(bytes_per_sec: float) -> str:
+    return f"{_human_size(bytes_per_sec)}/s"
 
 
-async def _httpx_stream_download(url: str, dest: Path):
+async def _download_with_progress(url: str, dest: Path, status_msg):
+    """
+    仅发送与编辑一个消息：
+    - 初始：下载中…
+    - 过程中：下载中… 进度/大小/速度
+    - 完成：编辑为“转换中…”
+    """
     timeout = httpx.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=WRITE_TIMEOUT)
     limits = httpx.Limits(max_keepalive_connections=MAX_KEEPALIVE, max_connections=MAX_CONNECTIONS)
+
+    last_edit = 0.0
+    last_bytes = 0
+    start = time.monotonic()
+
     async with httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=True) as client:
         async with client.stream("GET", url) as resp:
             resp.raise_for_status()
+            total = int(resp.headers.get("Content-Length") or 0)
+
+            # 初始提示
+            try:
+                if total > 0:
+                    await status_msg.edit_text(f"下载中… 0% (0 / {_human_size(total)}) 0 B/s")
+                else:
+                    await status_msg.edit_text("下载中… (大小未知)")
+            except Exception:
+                pass
+
             with open(dest, "wb") as f:
+                downloaded = 0
                 async for chunk in resp.aiter_bytes():
-                    if chunk:
-                        f.write(chunk)
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+                    now = time.monotonic()
+                    # 节流：每秒最多编辑一次，且至少前进 1%
+                    need_update = False
+                    if now - last_edit >= 1.0:
+                        need_update = True
+                    elif total > 0:
+                        prev_pct = int((last_bytes / total) * 100)
+                        curr_pct = int((downloaded / total) * 100)
+                        if curr_pct > prev_pct:
+                            need_update = True
+
+                    if need_update:
+                        elapsed = max(now - start, 1e-6)
+                        speed = (downloaded / elapsed)
+                        try:
+                            if total > 0:
+                                pct = int(downloaded * 100 / total)
+                                await status_msg.edit_text(
+                                    f"下载中… {pct}% ({_human_size(downloaded)} / {_human_size(total)}) {_fmt_speed(speed)}"
+                                )
+                            else:
+                                await status_msg.edit_text(
+                                    f"下载中… {_human_size(downloaded)} {_fmt_speed(speed)}"
+                                )
+                        except Exception:
+                            pass
+                        last_edit = now
+                        last_bytes = downloaded
+
+    # 下载完成 → 转换中
+    try:
+        await status_msg.edit_text("转换中…")
+    except Exception:
+        pass
 
 
 def _build_direct_file_url(file_path: str) -> Optional[str]:
@@ -162,14 +214,12 @@ def _pick_local_source(file_path: str) -> Optional[str]:
     if not file_path:
         return None
 
-    # file_path 可能是完整 URL，提取绝对路径子串
     if BOT_API_LOCAL_ROOT in file_path:
         idx = file_path.find(BOT_API_LOCAL_ROOT)
         candidate = file_path[idx:]
         if os.path.exists(candidate):
             return candidate
 
-    # 或者 file_path 本身就是绝对路径
     if file_path.startswith("/") and os.path.exists(file_path):
         return file_path
 
@@ -212,8 +262,12 @@ def _safe_remove_local_source(local_src: Optional[str]):
 
 
 async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 只维护一个“进度/状态”消息：下载中…（带进度/速度）→ 转换中… → 成功后删除；失败则将其改为错误信息
     if not _has_ffmpeg():
-        await update.effective_message.reply_text("服务器未安装 ffmpeg 或 ffmpeg 不可用。请安装后重试。")
+        try:
+            await update.effective_message.reply_text("转换失败：服务器未安装 ffmpeg。")
+        except Exception:
+            pass
         return
 
     msg = update.effective_message
@@ -231,11 +285,9 @@ async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename = msg.document.file_name
 
     if not video:
-        await msg.reply_text("请发送视频文件。")
-        return
+        return  # 不多发消息
 
-    status = await msg.reply_text("已收到视频，正在准备并转换音频，请稍候…")
-    await _send_chat_action(update, ChatAction.TYPING, context)
+    status_msg = None
 
     try:
         logger.info("Calling get_file for file_id=%s", video.file_id)
@@ -252,25 +304,46 @@ async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
             out_name = _suggest_filename(filename, "audio", AUDIO_EXT)
             out_path = td_path / out_name
 
+            # 下载阶段
             if local_source:
+                # 本地直读：直接进入转换阶段，仅发“转换中…”
+                status_msg = await msg.reply_text("转换中…")
                 input_path = Path(local_source)
                 logger.info("Using local source: %s", input_path)
             else:
-                try:
-                    logger.info("Downloading via PTB to %s", temp_dl)
-                    await file.download_to_drive(custom_path=str(temp_dl))
-                    input_path = temp_dl
-                    logger.info("PTB download completed: %s bytes", temp_dl.stat().st_size if temp_dl.exists() else "unknown")
-                except Exception as dl_err:
-                    logger.warning("PTB download failed: %s. Will try direct URL fallback.", dl_err)
-                    direct_url = _build_direct_file_url(fpath)
-                    if not direct_url:
-                        raise
-                    logger.info("Direct downloading from %s", direct_url.replace(BOT_TOKEN, "<token>"))
-                    await _httpx_stream_download(direct_url, temp_dl)
-                    input_path = temp_dl
-                    logger.info("Direct download completed: %s bytes", temp_dl.stat().st_size if temp_dl.exists() else "unknown")
+                # 优先直链下载（可显示进度）；否则回退 PTB 下载（无法显示进度）
+                direct_url = _build_direct_file_url(fpath)
+                if direct_url:
+                    status_msg = await msg.reply_text("下载中…")
+                    try:
+                        await _download_with_progress(direct_url, temp_dl, status_msg)
+                        input_path = temp_dl
+                    except Exception as dl_err:
+                        logger.error("Direct download failed: %s", dl_err)
+                        try:
+                            await status_msg.edit_text("下载失败，请稍后重试。")
+                        except Exception:
+                            pass
+                        return
+                else:
+                    # 回退：无直链，只能下载完后再进入转换
+                    status_msg = await msg.reply_text("下载中…")
+                    try:
+                        await file.download_to_drive(custom_path=str(temp_dl))
+                        input_path = temp_dl
+                        try:
+                            await status_msg.edit_text("转换中…")
+                        except Exception:
+                            pass
+                    except Exception as dl_err:
+                        logger.error("PTB download failed: %s", dl_err)
+                        try:
+                            await status_msg.edit_text("下载失败，请稍后重试。")
+                        except Exception:
+                            pass
+                        return
 
+            # 转换阶段
             codec_map = {
                 "mp3": "libmp3lame",
                 "m4a": "aac",
@@ -299,20 +372,23 @@ async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if proc.returncode != 0 or not out_path.exists():
                 tail = (proc.stderr or "")[-2000:]
                 logger.error("ffmpeg failed: %s", tail)
-                await status.edit_text("转换失败：ffmpeg 处理出错。请确认视频编码有效或稍后重试。")
+                try:
+                    if status_msg:
+                        await status_msg.edit_text("转换失败，请稍后重试。")
+                    else:
+                        await msg.reply_text("转换失败，请稍后重试。")
+                except Exception:
+                    pass
                 _safe_remove_local_source(local_source)
                 return
 
-            await status.edit_text("转换完成，正在发送音频…")
-            await _send_chat_action(update, ChatAction.UPLOAD_DOCUMENT, context)
-
+            # 发送音频（无 caption）
             send_ok = False
             try:
                 with open(out_path, "rb") as f:
                     await msg.reply_audio(
                         audio=f,
                         filename=out_name,
-                        caption=f"已从视频提取音频（{AUDIO_EXT.upper()}）",
                     )
                 send_ok = True
             except Exception as send_err:
@@ -322,26 +398,38 @@ async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await msg.reply_document(
                             document=f,
                             filename=out_name,
-                            caption=f"已从视频提取音频（{AUDIO_EXT.upper()}）",
                         )
                     send_ok = True
                 except Exception as send_err2:
                     logger.error("send_document also failed: %s", send_err2)
                     send_ok = False
 
+            # 清理与收尾
             if CLEANUP_OUTPUT:
                 _safe_unlink(out_path)
             _safe_remove_local_source(local_source)
 
-            if send_ok:
-                await status.delete()
-            else:
-                await status.edit_text("发送失败，请稍后重试。")
+            if send_ok and status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            elif not send_ok:
+                try:
+                    if status_msg:
+                        await status_msg.edit_text("发送失败，请稍后重试。")
+                    else:
+                        await msg.reply_text("发送失败，请稍后重试。")
+                except Exception:
+                    pass
 
     except Exception as e:
         logger.exception("Processing error: %s", e)
         try:
-            await status.edit_text("处理失败，可能是文件过大或网络或路径权限问题。请稍后重试，并检查容器卷挂载。")
+            if status_msg:
+                await status_msg.edit_text("处理失败，请稍后重试。")
+            else:
+                await msg.reply_text("处理失败，请稍后重试。")
         except Exception:
             pass
 
@@ -351,7 +439,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling an update:", exc_info=context.error)
     try:
         if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text("发生错误，我已记录日志。请稍后重试。")
+            await update.effective_message.reply_text("发生错误，请稍后重试。")
     except Exception:
         pass
 
@@ -361,6 +449,7 @@ def _build_request_safe():
         logger.warning("HTTPXRequest not available; using default PTB request.")
         return None
 
+    # 分级降级，适配不同 ptb 版本
     try:
         limits = httpx.Limits(max_keepalive_connections=MAX_KEEPALIVE, max_connections=MAX_CONNECTIONS)
         req = HTTPXRequest(
@@ -424,6 +513,9 @@ def _build_application() -> Application:
     if file_base:
         FILE_URL_PREFIX = f"{file_base}{BOT_TOKEN}"
         logger.info("Direct file URL prefix prepared.")
+    else:
+        # 未设置自建 file_base 时，默认使用官方直链前缀，便于显示下载进度
+        FILE_URL_PREFIX = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
     if base_url:
         logger.info("Using self-hosted Bot API server: base_url=%s | base_file_url=%s", base_url, file_base)
@@ -462,8 +554,8 @@ def _build_application() -> Application:
         logger.info("Authorization disabled (ALLOWED_USER_IDS & ALLOWED_CHAT_IDS empty). Bot is open to all chats/users.")
 
     # Handlers（均附带授权过滤器）
-    app.add_handler(CommandHandler("start", start, filters=allowed_filter))
-    app.add_handler(CommandHandler("help", help_cmd, filters=allowed_filter))
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("发送视频即可，我会返回音频。"), filters=allowed_filter))
+    app.add_handler(CommandHandler("help", lambda u, c: u.message.reply_text("发送视频，我会抽取音频并返回。"), filters=allowed_filter))
     app.add_handler(MessageHandler((filters.VIDEO | filters.VIDEO_NOTE) & allowed_filter, handle_video_like))
     app.add_handler(MessageHandler(filters.Document.MimeType("video/") & allowed_filter, handle_video_like))
     app.add_error_handler(error_handler)
