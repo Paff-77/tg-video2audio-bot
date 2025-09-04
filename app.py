@@ -261,6 +261,30 @@ def _safe_remove_local_source(local_src: Optional[str]):
         logger.warning("Failed to delete local source %s: %s", local_src, e)
 
 
+def _probe_duration_seconds(path: Path) -> Optional[int]:
+    """
+    使用 ffprobe 读取音频时长（秒，四舍五入）。若失败返回 None。
+    """
+    try:
+        # 优先读音频流时长，其次读容器时长
+        cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=duration",
+               "-of", "default=nw=1:nk=1", str(path)]
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out = (r.stdout or "").strip()
+        if not out or out == "N/A":
+            cmd2 = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=nw=1:nk=1", str(path)]
+            r2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            out = (r2.stdout or "").strip()
+        if out and out != "N/A":
+            seconds = float(out)
+            if seconds > 0:
+                return int(round(seconds))
+    except Exception as e:
+        logger.debug("ffprobe duration failed: %s", e)
+    return None
+
+
 async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 只维护一个“进度/状态”消息：下载中…（带进度/速度）→ 转换中… → 成功后删除；失败则将其改为错误信息
     if not _has_ffmpeg():
@@ -343,7 +367,7 @@ async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             pass
                         return
 
-            # 转换阶段
+            # 转换阶段（写入有助于时长识别的容器/标签选项）
             codec_map = {
                 "mp3": "libmp3lame",
                 "m4a": "aac",
@@ -354,17 +378,31 @@ async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "flac": "flac",
                 "wav": "pcm_s16le",
             }
-            acodec = codec_map.get(AUDIO_EXT.lower(), "libmp3lame")
+            ext = AUDIO_EXT.lower()
+            acodec = codec_map.get(ext, "libmp3lame")
             cmd = [
                 FFMPEG_BIN, "-y",
                 "-i", str(input_path),
                 "-vn",
                 "-acodec", acodec,
             ]
-            if AUDIO_EXT.lower() in {"mp3", "m4a", "aac", "opus", "ogg"} and AUDIO_BITRATE:
+            if ext in {"mp3", "m4a", "aac", "opus", "ogg"} and AUDIO_BITRATE:
                 cmd += ["-b:a", AUDIO_BITRATE]
-            if AUDIO_EXT.lower() in {"opus", "ogg"}:
+            if ext in {"opus", "ogg"}:
                 cmd += ["-vbr", "on"]
+
+            # 关键：为不同封装补上便于 Telegram 识别时长的元数据/封装选项
+            if ext == "mp3":
+                # 写入 Xing/LAME 头以携带精确时长（尤其是 VBR）
+                cmd += ["-write_xing", "1", "-id3v2_version", "3"]
+            elif ext == "m4a":
+                # 将 moov 元数据前移，部分客户端依赖此以正确读取
+                cmd += ["-movflags", "+faststart"]
+            elif ext == "aac":
+                # ADTS 裸流本身对部分客户端不友好，时长可能不稳定
+                # 建议使用 m4a；这里保留 aac 以兼容你的选择
+                pass
+
             cmd.append(str(out_path))
 
             logger.info("Running ffmpeg: %s", shlex.join(cmd))
@@ -382,23 +420,23 @@ async def handle_video_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _safe_remove_local_source(local_source)
                 return
 
-            # 发送音频（无 caption）
+            # 用 ffprobe 读取时长并传给 sendAudio，确保 Telegram 能显示总时长/进度
+            duration_sec = _probe_duration_seconds(out_path)
+
+            # 发送音频（无 caption），发送成功后删除“状态消息”
             send_ok = False
             try:
                 with open(out_path, "rb") as f:
-                    await msg.reply_audio(
-                        audio=f,
-                        filename=out_name,
-                    )
+                    kwargs = {"filename": out_name}
+                    if duration_sec and duration_sec > 0:
+                        kwargs["duration"] = int(duration_sec)
+                    await msg.reply_audio(audio=f, **kwargs)
                 send_ok = True
             except Exception as send_err:
                 logger.warning("send_audio failed, fallback to send_document: %s", send_err)
                 try:
                     with open(out_path, "rb") as f:
-                        await msg.reply_document(
-                            document=f,
-                            filename=out_name,
-                        )
+                        await msg.reply_document(document=f, filename=out_name)
                     send_ok = True
                 except Exception as send_err2:
                     logger.error("send_document also failed: %s", send_err2)
